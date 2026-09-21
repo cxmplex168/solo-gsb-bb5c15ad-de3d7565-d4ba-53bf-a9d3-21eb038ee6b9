@@ -1,6 +1,7 @@
 """SQLite 持久层：过敏原字典 + 审查记录。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,19 @@ CREATE TABLE IF NOT EXISTS reviews (
     result     TEXT NOT NULL,
     created_at TEXT NOT NULL,
     dict_fingerprint TEXT
+);
+-- 迁移导入 / 恢复的「最新恢复点」：单行（id=1），每次成功替换前在同一
+-- 事务内覆盖保存替换前的字典 / 别名 / 审查记录全量快照，替换失败回滚
+-- 时该行不会落库；因此库中存在的恢复点必定对应一次成功的整体替换。
+CREATE TABLE IF NOT EXISTS migration_restore_point (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    created_at  TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    counts      TEXT NOT NULL,
+    summary     TEXT NOT NULL,
+    dict_data   TEXT NOT NULL,
+    alias_data  TEXT NOT NULL,
+    review_data TEXT NOT NULL
 );
 """
 
@@ -318,23 +332,22 @@ def delete_review(rid: int) -> None:
 
 # ---------- 审查数据迁移包 ----------
 
-def export_snapshot() -> dict:
-    """全量读取三张表（只读），供迁移包导出使用。
+def _read_snapshot(conn: sqlite3.Connection) -> dict:
+    """在给定连接上全量读取三张表（事务内一致视图）。
 
     字典按原料名、别名按归一化别名（alias_key）、审查记录按 ID 排序，
     同一数据库重复读取顺序稳定。
     """
-    with _lock, _connect() as conn:
-        d = conn.execute(
-            "SELECT ingredient, allergens, updated_at FROM allergen_dict "
-            "ORDER BY ingredient").fetchall()
-        a = conn.execute(
-            "SELECT alias_name, target_name, updated_at FROM ingredient_aliases "
-            "ORDER BY alias_key").fetchall()
-        r = conn.execute(
-            "SELECT id, name, declared, text_a, text_b, label_a, label_b, "
-            "result, created_at, dict_fingerprint FROM reviews ORDER BY id"
-        ).fetchall()
+    d = conn.execute(
+        "SELECT ingredient, allergens, updated_at FROM allergen_dict "
+        "ORDER BY ingredient").fetchall()
+    a = conn.execute(
+        "SELECT alias_name, target_name, updated_at FROM ingredient_aliases "
+        "ORDER BY alias_key").fetchall()
+    r = conn.execute(
+        "SELECT id, name, declared, text_a, text_b, label_a, label_b, "
+        "result, created_at, dict_fingerprint FROM reviews ORDER BY id"
+    ).fetchall()
     return {
         "dict": [{"ingredient": row["ingredient"],
                   "allergens": json.loads(row["allergens"]),
@@ -352,6 +365,36 @@ def export_snapshot() -> dict:
     }
 
 
+def _canonical_json(obj) -> str:
+    """规范化 JSON：对象键排序、紧凑分隔符、UTF-8（不转义非 ASCII）。
+
+    与 :func:`app.migration.canonical_json` 口径一致；在 db 层就地实现，
+    避免 db ↔ migration 循环导入。
+    """
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+
+
+def snapshot_digest(snap: dict) -> str:
+    """对三段快照按规范化内容计算 SHA-256（恢复点的「摘要」）。
+
+    快照三段均按固定排序读取，故同一数据重算结果稳定；恢复应用后再
+    计算的摘要与恢复点保存时一致（逐字节往返）。
+    """
+    return hashlib.sha256(_canonical_json(snap).encode("utf-8")).hexdigest()
+
+
+def _snapshot_counts(snap: dict) -> dict:
+    return {"dict": len(snap["dict"]), "aliases": len(snap["aliases"]),
+            "reviews": len(snap["reviews"])}
+
+
+def export_snapshot() -> dict:
+    """全量读取三张表（只读），供迁移包导出使用。"""
+    with _lock, _connect() as conn:
+        return _read_snapshot(conn)
+
+
 def table_counts() -> dict:
     """三张表当前行数（迁移包预检展示用，只读）。"""
     with _lock, _connect() as conn:
@@ -365,40 +408,139 @@ def table_counts() -> dict:
         }
 
 
-def replace_all(*, dict_entries: List[dict], aliases: List[dict],
-                reviews: List[dict]) -> None:
-    """在**单个 SQLite 事务**内整体替换三张表；任一步失败整体回滚。
+# 恢复点来源（reason）取值：迁移确认导入 / 一键恢复
+RESTORE_REASON_IMPORT = "migration_import"
+RESTORE_REASON_RESTORE = "restore"
 
-    调用方必须先通过 :func:`app.migration.validate_package` 校验。
-    记录 ID、创建 / 更新时间、字典指纹均按迁移包原样保留，因此导入后
-    再导出的摘要与导入前一致。``with conn:`` 正常退出时提交、异常时
-    回滚，保证「整体替换」要么全部生效、要么完全不生效。
+
+def _save_restore_point(conn: sqlite3.Connection, snap: dict,
+                        reason: str, created_at: str) -> dict:
+    """在给定连接 / 事务内把快照覆盖写为「最新恢复点」（单行 id=1）。"""
+    counts = _snapshot_counts(snap)
+    summary = snapshot_digest(snap)
+    conn.execute(
+        "INSERT INTO migration_restore_point "
+        "(id, created_at, reason, counts, summary, dict_data, alias_data, "
+        "review_data) VALUES (1, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, "
+        "reason=excluded.reason, counts=excluded.counts, "
+        "summary=excluded.summary, dict_data=excluded.dict_data, "
+        "alias_data=excluded.alias_data, review_data=excluded.review_data",
+        (created_at, reason, json.dumps(counts, ensure_ascii=False), summary,
+         json.dumps(snap["dict"], ensure_ascii=False),
+         json.dumps(snap["aliases"], ensure_ascii=False),
+         json.dumps(snap["reviews"], ensure_ascii=False)))
+    return {"created_at": created_at, "reason": reason, "counts": counts,
+            "summary": summary}
+
+
+def _apply_snapshot(conn: sqlite3.Connection, *,
+                    dict_entries: List[dict], aliases: List[dict],
+                    reviews: List[dict]) -> None:
+    """在给定连接 / 事务内整体替换三张表。"""
+    conn.execute("DELETE FROM reviews")
+    conn.execute("DELETE FROM ingredient_aliases")
+    conn.execute("DELETE FROM allergen_dict")
+    for e in dict_entries:
+        conn.execute(
+            "INSERT INTO allergen_dict (ingredient, allergens, updated_at) "
+            "VALUES (?, ?, ?)",
+            (e["ingredient"],
+             json.dumps(e["allergens"], ensure_ascii=False),
+             e["updated_at"]))
+    for e in aliases:
+        conn.execute(
+            "INSERT INTO ingredient_aliases "
+            "(alias_key, alias_name, target_key, target_name, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (normalize_name(e["alias"]), e["alias"],
+             normalize_name(e["target"]), e["target"], e["updated_at"]))
+    for r in reviews:
+        conn.execute(
+            "INSERT INTO reviews (id, name, declared, text_a, text_b, "
+            "label_a, label_b, result, created_at, dict_fingerprint) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (r["id"], r["name"],
+             json.dumps(r["declared"], ensure_ascii=False),
+             r["text_a"], r["text_b"], r["label_a"], r["label_b"],
+             json.dumps(r["result"], ensure_ascii=False),
+             r["created_at"], r["dict_fingerprint"]))
+
+
+def get_restore_point() -> Optional[dict]:
+    """读取「最新恢复点」元信息（不含快照数据，只读）。
+
+    返回 ``created_at`` / ``reason`` / ``counts``（三类数量）/ ``summary``
+    （规范化内容 SHA-256，恢复时需原样输入做二次确认）；无恢复点时 None。
     """
     with _lock, _connect() as conn:
-        conn.execute("DELETE FROM reviews")
-        conn.execute("DELETE FROM ingredient_aliases")
-        conn.execute("DELETE FROM allergen_dict")
-        for e in dict_entries:
-            conn.execute(
-                "INSERT INTO allergen_dict (ingredient, allergens, updated_at) "
-                "VALUES (?, ?, ?)",
-                (e["ingredient"],
-                 json.dumps(e["allergens"], ensure_ascii=False),
-                 e["updated_at"]))
-        for e in aliases:
-            conn.execute(
-                "INSERT INTO ingredient_aliases "
-                "(alias_key, alias_name, target_key, target_name, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (normalize_name(e["alias"]), e["alias"],
-                 normalize_name(e["target"]), e["target"], e["updated_at"]))
-        for r in reviews:
-            conn.execute(
-                "INSERT INTO reviews (id, name, declared, text_a, text_b, "
-                "label_a, label_b, result, created_at, dict_fingerprint) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (r["id"], r["name"],
-                 json.dumps(r["declared"], ensure_ascii=False),
-                 r["text_a"], r["text_b"], r["label_a"], r["label_b"],
-                 json.dumps(r["result"], ensure_ascii=False),
-                 r["created_at"], r["dict_fingerprint"]))
+        row = conn.execute(
+            "SELECT created_at, reason, counts, summary "
+            "FROM migration_restore_point WHERE id = 1").fetchone()
+    if not row:
+        return None
+    return {"created_at": row["created_at"], "reason": row["reason"],
+            "counts": json.loads(row["counts"]), "summary": row["summary"]}
+
+
+def replace_all(*, dict_entries: List[dict], aliases: List[dict],
+                reviews: List[dict]) -> dict:
+    """在**单个 SQLite 事务**内保存恢复点并整体替换三张表。
+
+    调用方必须先通过 :func:`app.migration.validate_package` 校验。
+    替换前先在**同一事务**内把当前字典 / 别名 / 审查记录全量快照覆盖
+    保存为最新恢复点（含时间、三类数量与摘要），再清空重写三张表；
+    任一步失败整体回滚——既不会出现半成品替换，也**不会生成恢复点**。
+    记录 ID、创建 / 更新时间、字典指纹均按迁移包原样保留，因此导入后
+    再导出的摘要与导入前一致。``with conn:`` 正常退出时提交、异常时
+    回滚，保证「整体替换 + 恢复点」要么全部生效、要么完全不生效。
+
+    返回 ``{"saved_restore_point": 替换前数据的恢复点元信息,
+    "imported": 新数据三类数量}``。
+    """
+    created_at = _now()
+    with _lock, _connect() as conn:
+        before = _read_snapshot(conn)
+        saved = _save_restore_point(conn, before, RESTORE_REASON_IMPORT,
+                                    created_at)
+        _apply_snapshot(conn, dict_entries=dict_entries, aliases=aliases,
+                        reviews=reviews)
+    return {"saved_restore_point": saved,
+            "imported": {"dict": len(dict_entries),
+                         "aliases": len(aliases),
+                         "reviews": len(reviews)}}
+
+
+def restore_from_point() -> dict:
+    """按最新恢复点一键恢复：单事务交换快照，恢复本身同样可撤回。
+
+    先在**同一事务**内把当前数据保存为新的恢复点（reason=restore），
+    再把三张表整体替换为原恢复点快照；任一步失败整体回滚，旧恢复点与
+    库内数据都保持不变。恢复后旧恢复点被「恢复前数据」的新恢复点覆盖，
+    因此误恢复可再次一键撤回。调用方负责先核对恢复点摘要（二次确认）。
+
+    返回 ``{"restored": 恢复后三类数量, "old_summary": 被恢复的恢复点
+    摘要, "saved_restore_point": 恢复前数据的新恢复点元信息}``；
+    无恢复点时抛 :class:`RestoreError`。
+    """
+    with _lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT created_at, counts, summary, dict_data, alias_data, "
+            "review_data FROM migration_restore_point WHERE id = 1"
+        ).fetchone()
+        if not row:
+            raise RestoreError("当前没有可恢复的恢复点")
+        current = _read_snapshot(conn)
+        saved = _save_restore_point(conn, current, RESTORE_REASON_RESTORE,
+                                    _now())
+        snap = {"dict": json.loads(row["dict_data"]),
+                "aliases": json.loads(row["alias_data"]),
+                "reviews": json.loads(row["review_data"])}
+        _apply_snapshot(conn, dict_entries=snap["dict"],
+                        aliases=snap["aliases"], reviews=snap["reviews"])
+    return {"restored": json.loads(row["counts"]),
+            "old_summary": row["summary"], "saved_restore_point": saved}
+
+
+class RestoreError(Exception):
+    """一键恢复被拒绝（无恢复点 / 摘要不匹配）。"""

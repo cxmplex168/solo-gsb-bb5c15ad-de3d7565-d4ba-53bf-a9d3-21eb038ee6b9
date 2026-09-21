@@ -602,11 +602,13 @@ assert db.get_review(panel_rid) == before_panel
 assert db.get_review(milk_rid) == before_milk
 print("12. 过敏原检测套餐规划（当前配方必须项/精确小数/子集DP/字典序并列/缺口/禁止选择/只读） OK")
 
-# 13. 审查数据迁移包（导出 / 只读预检 / 一次性令牌确认导入 / 事务回滚）
+# 13. 审查数据迁移包（导出 / 只读预检 / 一次性令牌确认导入 / 事务回滚 / 恢复点）
 import json as _json
 
-from app.migration import (MigrationConfirmError, build_export, confirm_import,
-                           package_digest, precheck_package)
+from app.migration import (MigrationConfirmError, RestoreConfirmError,
+                           build_export, confirm_import, confirm_restore,
+                           package_digest, precheck_package,
+                           restore_point_status)
 
 # 13a. 导出：三段数据 + 格式版本 + 规范化 SHA-256；同一数据库重复导出内容稳定
 pkg_a, pkg_b = build_export(), build_export()
@@ -664,6 +666,37 @@ except MigrationConfirmError:
 # 往返稳定：再导出摘要与原始一致；记录数不变
 assert build_export()["sha256"] == pkg_a["sha256"]
 assert len(db.list_reviews()) == 6
-print("13. 审查数据迁移包（导出稳定/规范化摘要/只读预检/逐项问题/一次性令牌/整体替换/往返一致） OK")
+
+# 13d. 恢复保护：确认导入已把含「临时原料」的替换前数据保存为最新恢复点
+pt = db.get_restore_point()
+assert pt is not None and pt["reason"] == db.RESTORE_REASON_IMPORT
+assert pt["counts"]["reviews"] == 6
+# 导入后数据里没有临时原料，恢复点摘要对应替换前快照
+assert "临时原料" not in {e["ingredient"] for e in db.list_dict()}
+st = restore_point_status()
+# 错摘要拒绝且不消费令牌
+try:
+    confirm_restore("错摘要", st["token"])
+    raise AssertionError("摘要不一致应拒绝")
+except RestoreConfirmError:
+    pass
+post_import_snap = db.export_snapshot()
+res = confirm_restore(pt["summary"], st["token"])
+assert res["ok"] and res["restored"] == pt["counts"]
+assert "临时原料" in {e["ingredient"] for e in db.list_dict()}
+# 恢复前的导入内容已交换为新恢复点（可撤回误恢复）
+st2 = restore_point_status()
+assert st2["point"]["reason"] == db.RESTORE_REASON_RESTORE
+assert st2["point"]["summary"] == db.snapshot_digest(post_import_snap)
+res = confirm_restore(st2["point"]["summary"], st2["token"])  # 撤回恢复
+assert "临时原料" not in {e["ingredient"] for e in db.list_dict()}
+assert build_export()["sha256"] == pkg_a["sha256"]
+# 恢复令牌一次性
+try:
+    confirm_restore(st2["point"]["summary"], st2["token"])
+    raise AssertionError("恢复令牌复用应被拒绝")
+except RestoreConfirmError:
+    pass
+print("13. 审查数据迁移包（导出稳定/规范化摘要/只读预检/逐项问题/一次性令牌/整体替换/往返一致/恢复点保存/一键恢复与撤回） OK")
 
 print("\n全部集成冒烟测试通过 ✔")

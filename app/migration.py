@@ -1,4 +1,4 @@
-"""审查数据迁移包：全量导出、只读预检与一次性令牌确认导入。
+"""审查数据迁移包：全量导出、只读预检与一次性令牌确认导入（含恢复保护）。
 
 导出
 ----
@@ -15,8 +15,18 @@
    **不写库**；全部通过时签发一枚**绑定该文件摘要的一次性确认令牌**
    （限时有效）。
 2. 确认导入：凭令牌 + 原文件文本确认；令牌不存在、已使用、已过期或与
-   文件摘要不匹配均拒绝。通过后在**单个 SQLite 事务**内整体替换字典 /
-   别名 / 审查记录三张表，任一步失败整体回滚。
+   文件摘要不匹配均拒绝。通过后在**单个 SQLite 事务**内先把当前字典 /
+   别名 / 审查记录覆盖保存为**最新恢复点**（含时间、三类数量与摘要），
+   再整体替换三张表；任一步失败整体回滚，**失败不会生成恢复点**。
+
+恢复保护
+--------
+- 迁移区始终展示最新恢复点（时间、来源、三类数量与内容摘要）。
+- 一键恢复需先原样输入该恢复点摘要做二次确认；确认时签发一枚
+  **绑定该摘要的一次性恢复令牌**（限时），恢复接口凭令牌执行。
+- 恢复与导入一样在单个事务内**先交换**：先把当前数据保存为新的恢复点，
+  再写回旧快照 —— 因此误恢复可以再一键撤回（新恢复点即恢复前数据）。
+- 恢复点只有一份（单行覆盖）：每次成功导入 / 成功恢复都会刷新它。
 """
 from __future__ import annotations
 
@@ -492,10 +502,14 @@ def validate_package(package) -> dict:
             "sha256": sha.lower() if sha_valid else None}
 
 
-# ---------- 一次性确认令牌 ----------
+# ---------- 一次性确认令牌（导入确认 / 恢复确认） ----------
 
 _tokens: Dict[str, dict] = {}
 _token_lock = threading.Lock()
+
+# 令牌用途：导入确认绑定迁移包摘要；恢复确认绑定恢复点摘要
+KIND_IMPORT = "import"
+KIND_RESTORE = "restore"
 
 
 def _purge_expired(now: float) -> None:
@@ -503,27 +517,31 @@ def _purge_expired(now: float) -> None:
         del _tokens[t]
 
 
-def issue_token(sha256: str) -> str:
-    """签发绑定指定文件摘要的一次性确认令牌（限时有效）。"""
+def issue_token(sha256: str, kind: str = KIND_IMPORT) -> str:
+    """签发绑定指定摘要的一次性确认令牌（限时有效）。"""
     token = secrets.token_urlsafe(24)
     with _token_lock:
         now = time.time()
         _purge_expired(now)
-        _tokens[token] = {"sha256": sha256,
+        _tokens[token] = {"sha256": sha256, "kind": kind,
                           "expires": now + TOKEN_TTL_SECONDS}
     return token
 
 
-def consume_token(token: str, sha256: str) -> bool:
-    """令牌存在、未过期且绑定该摘要时消费之（一次性，消费后即失效）。"""
+def consume_token(token: str, sha256: str, kind: str = KIND_IMPORT) -> bool:
+    """令牌存在、未过期、用途与摘要均匹配时消费之（一次性，消费后失效）。
+
+    用途不同或摘要不匹配均不算消费：用户可能拿错令牌 / 选错了文件，
+    应允许其改用正确的令牌重试。
+    """
     if not token:
         return False
     with _token_lock:
         entry = _tokens.get(token)
         if not entry or entry["expires"] <= time.time():
             return False
-        if entry["sha256"] != sha256:
-            return False  # 摘要不匹配不算消费：用户可能选错了文件
+        if entry["kind"] != kind or entry["sha256"] != sha256:
+            return False
         del _tokens[token]
     return True
 
@@ -542,7 +560,7 @@ def precheck_package(text: str) -> dict:
     """只读预检：解析并逐项校验迁移包，**不写库**。
 
     全部通过时签发绑定该文件摘要的一次性确认令牌，并附上包内数据量、
-    当前库数据量与面向确认的警告，供页面展示。
+    当前库数据量、最新恢复点与面向确认的警告，供页面展示。
     """
     try:
         package = json.loads(text)
@@ -559,20 +577,23 @@ def precheck_package(text: str) -> dict:
         if any(cur.values()):
             outcome["warnings"].append(
                 f"导入将整体替换当前数据（现有：字典 {cur['dict']} 条 / "
-                f"别名 {cur['aliases']} 条 / 审查记录 {cur['reviews']} 条），"
-                "替换后不可恢复")
+                f"别名 {cur['aliases']} 条 / 审查记录 {cur['reviews']} 条）；"
+                "替换前会自动把当前数据保存为最新恢复点，可在迁移区"
+                "凭摘要一键恢复（恢复本身也可再撤回）")
         outcome["token"] = issue_token(outcome["sha256"])
         outcome["expires_in"] = TOKEN_TTL_SECONDS
     else:
         outcome["token"] = None
+    outcome["restore_point"] = db.get_restore_point()
     return outcome
 
 
 def confirm_import(text: str, token: str) -> dict:
-    """凭一次性令牌确认导入：单个 SQLite 事务整体替换，失败回滚。
+    """凭一次性令牌确认导入：单事务内保存恢复点 + 整体替换，失败回滚。
 
     令牌必须绑定该文件的摘要（即预检通过的是同一份内容）；确认前会
-    再次完整校验，任一步失败都不写库或整体回滚。
+    再次完整校验，任一步失败都不写库、不生成恢复点或整体回滚。成功时
+    返回导入数量、包摘要，以及替换前数据保存成的最新恢复点信息。
     """
     try:
         package = json.loads(text)
@@ -581,7 +602,7 @@ def confirm_import(text: str, token: str) -> dict:
     if not isinstance(package, dict):
         raise MigrationConfirmError("迁移包顶层应为 JSON 对象")
     digest = package_digest(package)
-    if not consume_token(token, digest):
+    if not consume_token(token, digest, KIND_IMPORT):
         raise MigrationConfirmError(
             "确认令牌无效、已使用、已过期或与迁移包摘要不匹配，请重新预检")
     outcome = validate_package(package)
@@ -589,6 +610,52 @@ def confirm_import(text: str, token: str) -> dict:
         raise MigrationConfirmError("迁移包校验未通过，未执行导入",
                                     outcome["problems"])
     data = package["data"]
-    db.replace_all(dict_entries=data["dict"], aliases=data["aliases"],
-                   reviews=data["reviews"])
-    return {"ok": True, "imported": _counts_of(data), "sha256": digest}
+    result = db.replace_all(dict_entries=data["dict"], aliases=data["aliases"],
+                            reviews=data["reviews"])
+    return {"ok": True, "imported": result["imported"], "sha256": digest,
+            "restore_point": result["saved_restore_point"]}
+
+
+# ---------- 恢复保护：最新恢复点与一键恢复 ----------
+
+class RestoreConfirmError(Exception):
+    """一键恢复被拒绝（无恢复点 / 摘要不一致 / 令牌无效）。"""
+
+
+def restore_point_status() -> dict:
+    """最新恢复点状态（只读）。
+
+    有恢复点时返回其元信息（时间 / 来源 / 三类数量 / 摘要），并签发一枚
+    **绑定该恢复点摘要的一次性恢复令牌**；无恢复点时 point 为 None。
+    """
+    point = db.get_restore_point()
+    token = issue_token(point["summary"], KIND_RESTORE) if point else None
+    return {"point": point, "token": token, "expires_in": TOKEN_TTL_SECONDS}
+
+
+def confirm_restore(summary: str, token: str) -> dict:
+    """凭一次性恢复令牌 + 恢复点摘要一键恢复。
+
+    恢复在单个 SQLite 事务内先交换：先把当前数据保存为新的恢复点
+    （误恢复可再撤回），再整体写回旧恢复点快照；任一步失败整体回滚，
+    旧恢复点与库内数据都不变（令牌仍已消费，需重新获取）。无恢复点或
+    摘要不一致在令牌校验之前拒绝（**不消费令牌**，允许改正后重试）；
+    令牌无效 / 已使用 / 已过期同样拒绝。
+    """
+    point = db.get_restore_point()
+    if not point:
+        raise RestoreConfirmError("当前没有可恢复的恢复点")
+    if not summary or summary.strip().lower() != point["summary"]:
+        # 摘要不一致不消费令牌：允许用户改正后用同一令牌重试
+        raise RestoreConfirmError(
+            "输入的摘要与最新恢复点摘要不一致，恢复未执行")
+    if not consume_token(token, point["summary"], KIND_RESTORE):
+        raise RestoreConfirmError(
+            "恢复令牌无效、已使用或已过期，请刷新恢复点信息后重试")
+    try:
+        result = db.restore_from_point()
+    except db.RestoreError as exc:
+        raise RestoreConfirmError(str(exc))
+    return {"ok": True, "restored": result["restored"],
+            "old_summary": result["old_summary"],
+            "restore_point": result["saved_restore_point"]}
