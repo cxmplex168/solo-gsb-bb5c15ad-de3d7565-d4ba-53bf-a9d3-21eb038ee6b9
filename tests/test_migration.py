@@ -14,6 +14,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 
 _DB_DIR = tempfile.mkdtemp(prefix="allergen-migration-")
@@ -362,6 +363,213 @@ class ImportFlowTest(Base):
         self.assertEqual(db.export_snapshot(), before)
         with self.assertRaises(MigrationConfirmError):
             confirm_import(self.text, token)
+
+
+class RestorePointTest(Base):
+    """导入恢复点：同事务保存、失败不产生、摘要二次确认恢复与撤回。"""
+
+    def setUp(self):
+        super().setUp()
+        self.pkg = build_export()
+        self.text = pkg_text(self.pkg)
+        # 导入前先制造与迁移包的差异：恢复点应保存这份“当前数据”
+        db.upsert_entry("临时原料", ["芥末"])
+        db.delete_alias("脱盐乳清")
+        self.pre_import = db.export_snapshot()
+        self.pre_digest = db.snapshot_digest(self.pre_import)
+        self.pre_counts = db.table_counts()
+        # 初始状态：没有恢复点
+        self.assertIsNone(db.get_restore_point())
+
+    def _do_import(self):
+        out = precheck_package(self.text)
+        self.assertTrue(out["ok"], out["problems"])
+        result = confirm_import(self.text, out["token"])
+        return result
+
+    def test_import_creates_restore_point_of_current_data(self):
+        result = self._do_import()
+        point = result["restore_point"]
+        self.assertIsNotNone(point)
+        self.assertEqual(point["reason"], "import")
+        self.assertEqual(point["counts"], self.pre_counts)
+        # 恢复点摘要 = 替换前当前数据的规范化摘要
+        self.assertEqual(point["digest"], self.pre_digest)
+        # 查询接口返回同一份最新恢复点元数据
+        meta = db.get_restore_point()
+        self.assertEqual(meta, point)
+        self.assertIn("created_at", point)
+        # 导入生效：当前数据来自迁移包
+        self.assertNotIn("临时原料",
+                         {e["ingredient"] for e in db.list_dict()})
+        self.assertEqual(len(db.list_aliases()), 1)
+
+    def test_restore_point_is_single_latest_row(self):
+        self._do_import()
+        # 再导入一次另一个合法包：恢复点被覆盖为最新（始终只有一个）
+        pkg2 = build_export()
+        db.upsert_entry("第二个临时原料", ["芝麻"])
+        second_before_digest = db.snapshot_digest(db.export_snapshot())
+        text2 = pkg_text(pkg2)
+        out2 = precheck_package(text2)
+        r2 = confirm_import(text2, out2["token"])
+        self.assertEqual(r2["restore_point"]["digest"], second_before_digest)
+        self.assertNotEqual(r2["restore_point"]["digest"], self.pre_digest)
+        self.assertEqual(db.get_restore_point(), r2["restore_point"])
+
+    def test_failed_replace_creates_no_restore_point(self):
+        # 直接调 db.replace_all 注入坏数据：事务回滚，恢复点也回滚
+        bad_reviews = [{"id": 9001, "name": "坏", "declared": [],
+                        "text_a": None,  # 违反 NOT NULL
+                        "text_b": None, "label_a": "A", "label_b": "B",
+                        "result": {}, "created_at": "t",
+                        "dict_fingerprint": None}]
+        with self.assertRaises(Exception):
+            db.replace_all(
+                dict_entries=[{"ingredient": "新原料", "allergens": [],
+                               "updated_at": "t"}],
+                aliases=[], reviews=bad_reviews)
+        self.assertIsNone(db.get_restore_point())
+        # 原有数据原样保留
+        self.assertEqual(db.export_snapshot(), self.pre_import)
+
+    def test_confirm_import_failure_leaves_no_restore_point(self):
+        out = precheck_package(self.text)
+        token = out["token"]
+        original = migration.db.replace_all
+
+        def boom(**kwargs):
+            raise RuntimeError("模拟写库失败")
+
+        migration.db.replace_all = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                confirm_import(self.text, token)
+        finally:
+            migration.db.replace_all = original
+        self.assertIsNone(db.get_restore_point())
+        self.assertEqual(db.export_snapshot(), self.pre_import)
+
+    def test_restore_requires_exact_digest_and_restores(self):
+        self._do_import()
+        # 无 / 空 / 错误摘要均拒绝
+        from app.migration import MigrationRestoreError
+        for bad in ("", "   ", "x" * 64, self.pre_digest.upper()):
+            with self.assertRaises(MigrationRestoreError):
+                migration.restore_from_point(bad)
+        # 拒绝不写库，恢复点不变
+        self.assertEqual(db.get_restore_point()["digest"], self.pre_digest)
+        # 正确摘要恢复：数据回到导入前（含临时原料、无别名）
+        r = migration.restore_from_point(self.pre_digest)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["restored"], self.pre_counts)
+        self.assertEqual(r["current_counts"], self.pre_counts)
+        self.assertIn("临时原料",
+                      {e["ingredient"] for e in db.list_dict()})
+        self.assertEqual(db.list_aliases(), [])
+        self.assertEqual(db.export_snapshot(), self.pre_import)
+
+    def test_restore_swaps_current_data_into_new_point_for_undo(self):
+        imp = self._do_import()
+        imported_digest = imp["sha256"]
+        self.assertNotEqual(imported_digest, self.pre_digest)
+        # 第一次恢复：回到导入前；当前（导入后）数据被交换成新恢复点
+        r1 = migration.restore_from_point(self.pre_digest)
+        new_point = r1["restore_point"]
+        self.assertEqual(new_point["reason"], "restore")
+        self.assertEqual(new_point["counts"], self.pkg["counts"])
+        self.assertEqual(db.get_restore_point(), new_point)
+        # 新恢复点的摘要对应导入后的库内容（即迁移包内容）
+        self.assertEqual(db.snapshot_digest(db.export_snapshot()),
+                         self.pre_digest)
+        # 误恢复可撤回：再恢复一次，重新得到导入后的数据
+        r2 = migration.restore_from_point(new_point["digest"])
+        self.assertEqual(r2["restored"], self.pkg["counts"])
+        self.assertEqual(build_export()["sha256"], imported_digest)
+        self.assertNotIn("临时原料",
+                         {e["ingredient"] for e in db.list_dict()})
+        # 撤回后又产生一个新的恢复点（reason=restore，内容为导入前），
+        # 可再次来回切换：恢复点链始终“再恢复一次即可撤回”
+        r3 = migration.restore_from_point(r2["restore_point"]["digest"])
+        self.assertIn("临时原料",
+                      {e["ingredient"] for e in db.list_dict()})
+        self.assertEqual(r3["restored"], self.pre_counts)
+
+    def test_restore_failure_is_atomic(self):
+        from app.migration import MigrationRestoreError
+        self._do_import()
+        before = db.export_snapshot()
+        original = migration.db.restore_from_point
+
+        def boom(digest):
+            raise RuntimeError("模拟恢复写库失败")
+
+        migration.db.restore_from_point = boom
+        try:
+            # db 层写库失败以原异常向上传播（接口层统一转 400），事务回滚
+            with self.assertRaises(RuntimeError):
+                migration.restore_from_point(self.pre_digest)
+        finally:
+            migration.db.restore_from_point = original
+        # 数据与恢复点均未变
+        self.assertEqual(db.export_snapshot(), before)
+        self.assertEqual(db.get_restore_point()["digest"], self.pre_digest)
+
+    def test_concurrent_confirm_only_one_takes_effect(self):
+        out1 = precheck_package(self.text)
+        out2 = precheck_package(self.text)
+        results, errors = [], []
+
+        def do(token):
+            try:
+                results.append(confirm_import(self.text, token))
+            except MigrationConfirmError as exc:
+                errors.append(str(exc))
+
+        t1 = threading.Thread(target=do, args=(out1["token"],))
+        t2 = threading.Thread(target=do, args=(out2["token"],))
+        t1.start(); t2.start(); t1.join(); t2.join()
+        # 两次并发确认最多一次成功；落败者收到明确提示
+        self.assertLessEqual(len(results), 1)
+        self.assertGreaterEqual(len(errors), 1)
+        self.assertTrue(
+            any("令牌" in m or "迁移导入 / 恢复" in m for m in errors))
+
+    def test_concurrent_restore_only_one_takes_effect(self):
+        self._do_import()
+        from app.migration import MigrationRestoreError
+        errors, finished = [], []
+
+        def do():
+            try:
+                migration.restore_from_point(self.pre_digest)
+                finished.append(1)
+            except MigrationRestoreError as exc:
+                errors.append(str(exc))
+
+        t1 = threading.Thread(target=do)
+        t2 = threading.Thread(target=do)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        self.assertEqual(len(finished), 1)
+        self.assertTrue(any("迁移导入 / 恢复" in m for m in errors))
+
+    def test_empty_database_import_creates_no_restore_point(self):
+        # 空库：confirm_import 显式不保存恢复点
+        db.replace_all(dict_entries=[], aliases=[], reviews=[],
+                       save_point=False)
+        self.assertIsNone(db.get_restore_point())
+        pkg = build_export()
+        pkg["data"]["dict"] = [{"ingredient": "新原料", "allergens": ["乳"],
+                                "updated_at": "t"}]
+        pkg["counts"] = {"dict": 1, "aliases": 0, "reviews": 0}
+        pkg["sha256"] = package_digest(pkg)
+        text = pkg_text(pkg)
+        out = precheck_package(text)
+        self.assertTrue(out["ok"], out["problems"])
+        result = confirm_import(text, out["token"])
+        self.assertIsNone(result["restore_point"])
+        self.assertIsNone(db.get_restore_point())
+        self.assertEqual([e["ingredient"] for e in db.list_dict()], ["新原料"])
 
 
 if __name__ == "__main__":

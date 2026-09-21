@@ -368,7 +368,10 @@
   <p class="hint">把字典、原料别名与全部审查记录打包为一个 JSON 迁移包：含格式版本号与按规范化内容
     计算的 SHA-256 摘要，同一数据库重复导出内容稳定（摘要一致）。导入先做<b>只读预检</b>——逐项校验
     版本 / 摘要 / 字段类型 / 别名图无环 / 审查记录结构，<b>不会写库</b>；预检通过后凭
-    <b>绑定该文件摘要的一次性确认令牌</b>确认导入，在单个事务内整体替换，任一步失败自动回滚。</p>
+    <b>绑定该文件摘要的一次性确认令牌</b>确认导入，在单个事务内整体替换，任一步失败自动回滚。
+    每次<b>成功替换前</b>会在同一事务中把当前字典、别名与审查记录保存为<b>最新恢复点</b>
+    （含时间、三类数量与内容摘要，替换失败不会产生恢复点），可在下方<b>输入恢复点摘要二次确认后
+    一键恢复</b>；恢复时同样先把当前数据交换成新的恢复点，因此误恢复也能再次撤回。</p>
   <h3>导出</h3>
   <div class="toolbar">
     <button onclick="exportMigration()">生成并下载迁移包</button>
@@ -376,7 +379,7 @@
   </div>
   <div id="mig-export-info"></div>
   <h3>导入</h3>
-  <p class="warn">⚠ 导入将<b>整体替换</b>当前字典、别名与全部审查记录，且不可撤销；请先导出备份。</p>
+  <p class="warn">⚠ 导入将<b>整体替换</b>当前字典、别名与全部审查记录；替换前会自动生成最新恢复点，可在下方一键恢复（恢复同样可撤回）。</p>
   <input type="file" id="mig-file" accept=".json,application/json" style="font-size:13px">
   <div class="toolbar">
     <button onclick="precheckMigration()">只读预检</button>
@@ -388,6 +391,18 @@
     <span class="hint" id="mig-confirm-hint"></span>
   </div>
   <div id="mig-import-result"></div>
+  <h3>恢复点（导入前自动保护）</h3>
+  <div id="mig-restore-point"></div>
+  <div id="mig-restore-wrap" class="hidden" style="margin-top:10px">
+    <p class="hint">请输入上方恢复点的完整摘要（64 位 SHA-256）以二次确认；恢复前会先把当前数据交换为新的恢复点，误恢复可再次一键撤回。</p>
+    <input type="text" id="mig-restore-digest" placeholder="粘贴恢复点 SHA-256 摘要"
+           style="width:680px;max-width:100%;font-family:monospace;font-size:12px">
+    <div class="toolbar" style="margin-top:6px">
+      <button class="danger" onclick="restoreFromPoint()">按摘要一键恢复</button>
+      <span id="mig-restore-msg" class="error"></span>
+    </div>
+  </div>
+  <div id="mig-restore-result"></div>
 </section>
 
 </main>
@@ -2056,11 +2071,51 @@ let migToken = null;
 let migText = null;
 
 const MIG_SECTION_LABEL = {package: '迁移包', dict: '字典', aliases: '别名', reviews: '审查记录'};
+const MIG_POINT_REASON_LABEL = {import: '确认导入前自动保存', restore: '一键恢复前交换保存'};
 
 function migCountsHtml(counts) {
   return counts
     ? `字典 <b>${counts.dict}</b> 条 · 别名 <b>${counts.aliases}</b> 条 · 审查记录 <b>${counts.reviews}</b> 条`
     : '<span class="hint">未知</span>';
+}
+
+async function refreshAfterMigration() {
+  await Promise.all([loadDict(), loadAliases(), loadHistory(), loadRestorePoint()]);
+}
+
+async function loadRestorePoint() {
+  try {
+    const r = await api('/api/migration/restore-point');
+    renderRestorePoint(r.restore_point);
+  } catch (e) {
+    $('mig-restore-point').innerHTML =
+      `<p class="error">恢复点加载失败：${esc(e.message)}</p>`;
+    $('mig-restore-wrap').classList.add('hidden');
+  }
+}
+
+function renderRestorePoint(p) {
+  if (!p) {
+    $('mig-restore-point').innerHTML =
+      '<p class="hint">暂无恢复点。成功确认导入（且当前库非空）后会自动生成。</p>';
+    $('mig-restore-wrap').classList.add('hidden');
+    return;
+  }
+  $('mig-restore-point').innerHTML = `<div class="result-block">
+    <p>产生时间：<b>${esc(p.created_at)}</b>
+       （${esc(MIG_POINT_REASON_LABEL[p.reason] || p.reason)}）<br>
+       数据量：${migCountsHtml(p.counts)}<br>
+       内容摘要（SHA-256）：<br><code id="mig-point-digest"
+       style="word-break:break-all">${esc(p.digest)}</code>
+       <a href="#" onclick="fillRestoreDigest();return false;" class="hint">填入摘要</a></p>
+    <p class="hint">恢复会把数据整体还原到该恢复点；恢复前当前数据会自动交换为新的恢复点，可再次撤回。</p>
+  </div>`;
+  $('mig-restore-wrap').classList.remove('hidden');
+}
+
+function fillRestoreDigest() {
+  const d = $('mig-point-digest');
+  if (d) $('mig-restore-digest').value = d.textContent.trim();
 }
 
 async function exportMigration() {
@@ -2144,28 +2199,58 @@ function renderMigPrecheck(r, fname) {
 
 async function confirmMigrationImport() {
   if (!migToken || !migText) return;
-  if (!confirm('确认导入？当前字典、别名与全部审查记录将被整体替换，且不可撤销。')) return;
+  if (!confirm('确认导入？当前字典、别名与全部审查记录将被整体替换。\n'
+             + '替换前会自动保存当前数据为最新恢复点，可在下方凭摘要一键恢复（恢复同样可撤回）。')) return;
   try {
     const r = await post('/api/migration/import', {token: migToken, text: migText});
     $('mig-confirm-wrap').classList.add('hidden');
+    const pointNote = r.restore_point
+      ? `已生成<b>最新恢复点</b>（${esc(r.restore_point.created_at)}，摘要 <code>${esc(r.restore_point.digest.slice(0, 12))}…</code>），可在下方凭完整摘要一键恢复。`
+      : '当前库原本为空，未生成恢复点。';
     $('mig-import-result').innerHTML = `<div class="recheck-bar"
       style="border-color:#86efac;background:#f0fdf4">✅ <b style="color:var(--green)">导入完成：</b>
       字典 ${r.imported.dict} 条、别名 ${r.imported.aliases} 条、审查记录 ${r.imported.reviews} 条
-      （SHA-256 <code>${esc(r.sha256.slice(0, 12))}…</code>），页面数据已刷新。</div>`;
+      （SHA-256 <code>${esc(r.sha256.slice(0, 12))}…</code>）。${pointNote} 页面数据已刷新。</div>`;
     migToken = null;
     migText = null;
     $('mig-file').value = '';
+    $('mig-restore-digest').value = '';
+    $('mig-restore-msg').textContent = '';
+    $('mig-restore-result').innerHTML = '';
     currentReviewId = null;
     $('result-section').classList.add('hidden');
-    await loadDict();
-    await loadAliases();
-    await loadHistory();
+    await refreshAfterMigration();
   } catch (e) {
     $('mig-import-result').innerHTML =
-      `<p class="error">导入失败：${esc(e.message)}（未写入任何数据，请重新预检）</p>`;
+      `<p class="error">导入失败：${esc(e.message)}（未写入任何数据，也不会生成恢复点；令牌若仍有效可重试，否则请重新预检）</p>`;
     $('mig-confirm-wrap').classList.add('hidden');
     migToken = null;
     migText = null;
+  }
+}
+
+async function restoreFromPoint() {
+  const digest = $('mig-restore-digest').value.trim();
+  $('mig-restore-msg').textContent = '';
+  if (!digest) {
+    $('mig-restore-msg').textContent = '请输入恢复点摘要（64 位 SHA-256）';
+    return;
+  }
+  if (!confirm('确认一键恢复？当前字典、别名与全部审查记录将被还原为恢复点内容。\n'
+             + '恢复前会先把当前数据交换为新的恢复点，误恢复可再次凭新摘要撤回。')) return;
+  try {
+    const r = await post('/api/migration/restore', {digest});
+    $('mig-restore-digest').value = '';
+    $('mig-restore-result').innerHTML = `<div class="recheck-bar"
+      style="border-color:#86efac;background:#f0fdf4">✅ <b style="color:var(--green)">恢复完成：</b>
+      已还原 字典 ${r.restored.dict} 条、别名 ${r.restored.aliases} 条、审查记录 ${r.restored.reviews} 条。
+      当前数据已交换为<b>新的最新恢复点</b>（${esc(r.restore_point.created_at)}，
+      摘要 <code>${esc(r.restore_point.digest.slice(0, 12))}…</code>），如为误恢复可再次撤回。页面数据已刷新。</div>`;
+    currentReviewId = null;
+    $('result-section').classList.add('hidden');
+    await refreshAfterMigration();
+  } catch (e) {
+    $('mig-restore-msg').textContent = '恢复失败：' + e.message;
   }
 }
 
@@ -2182,7 +2267,7 @@ async function fillDemo() {
   $('dict-msg').textContent = '示例已填充，点击“开始审查”查看效果';
 }
 
-loadDict().then(() => Promise.all([loadHistory(), loadAliases()]))
+loadDict().then(() => Promise.all([loadHistory(), loadAliases(), loadRestorePoint()]))
   .catch(e => alert('初始化失败：' + e.message));
 </script>
 </body>

@@ -602,11 +602,13 @@ assert db.get_review(panel_rid) == before_panel
 assert db.get_review(milk_rid) == before_milk
 print("12. 过敏原检测套餐规划（当前配方必须项/精确小数/子集DP/字典序并列/缺口/禁止选择/只读） OK")
 
-# 13. 审查数据迁移包（导出 / 只读预检 / 一次性令牌确认导入 / 事务回滚）
+# 13. 审查数据迁移包（导出 / 只读预检 / 一次性令牌确认导入 / 恢复点保护 / 一键恢复与撤回 / 事务回滚）
 import json as _json
 
-from app.migration import (MigrationConfirmError, build_export, confirm_import,
-                           package_digest, precheck_package)
+from app.migration import (MigrationConfirmError, MigrationRestoreError,
+                           build_export, confirm_import, latest_restore_point,
+                           package_digest, precheck_package,
+                           restore_from_point)
 
 # 13a. 导出：三段数据 + 格式版本 + 规范化 SHA-256；同一数据库重复导出内容稳定
 pkg_a, pkg_b = build_export(), build_export()
@@ -652,6 +654,10 @@ try:
 except MigrationConfirmError:
     pass
 db.upsert_entry("临时原料", ["芥末"])  # 导入后应被整体替换掉
+pre_import_snap = db.export_snapshot()
+pre_import_digest = db.snapshot_digest(pre_import_snap)
+pre_import_counts = db.table_counts()
+assert latest_restore_point() is None  # 尚未有过成功导入，无恢复点
 res = confirm_import(pkg_text, token)
 assert res["ok"] and res["imported"] == pkg_a["counts"]
 assert res["sha256"] == pkg_a["sha256"]
@@ -664,6 +670,55 @@ except MigrationConfirmError:
 # 往返稳定：再导出摘要与原始一致；记录数不变
 assert build_export()["sha256"] == pkg_a["sha256"]
 assert len(db.list_reviews()) == 6
-print("13. 审查数据迁移包（导出稳定/规范化摘要/只读预检/逐项问题/一次性令牌/整体替换/往返一致） OK")
+
+# 13d. 恢复点：成功替换前在同一事务保存当前数据（含临时原料），替换失败不产生
+point = latest_restore_point()
+assert point is not None and point["reason"] == "import"
+assert point["counts"] == pre_import_counts
+assert point["digest"] == pre_import_digest
+assert res["restore_point"] == point
+
+# 13e. 一键恢复：必须输入与恢复点逐字一致的摘要二次确认
+for bad_digest in ("", "  ", "0" * 64, point["digest"].upper()):
+    try:
+        restore_from_point(bad_digest)
+        raise AssertionError("错误 / 空摘要应被拒绝")
+    except MigrationRestoreError:
+        pass
+rres = restore_from_point(point["digest"])
+assert rres["restored"] == pre_import_counts
+assert rres["current_counts"] == pre_import_counts
+assert db.export_snapshot() == pre_import_snap  # 完整回到导入前
+assert "临时原料" in {e["ingredient"] for e in db.list_dict()}
+
+# 13f. 恢复前当前数据已交换为新恢复点（reason=restore），误恢复可一键撤回
+swap_point = rres["restore_point"]
+assert swap_point["reason"] == "restore"
+assert swap_point["counts"] == pkg_a["counts"]
+assert latest_restore_point()["digest"] == swap_point["digest"]
+undo = restore_from_point(swap_point["digest"])
+assert "临时原料" not in {e["ingredient"] for e in db.list_dict()}
+assert undo["restored"] == pkg_a["counts"]
+assert build_export()["sha256"] == pkg_a["sha256"]
+# 撤回后再恢复又可回到含临时原料的状态：来回切换始终可再撤
+again = restore_from_point(undo["restore_point"]["digest"])
+assert "临时原料" in {e["ingredient"] for e in db.list_dict()}
+assert again["restored"] == pre_import_counts
+
+# 13g. 并发恢复互斥：同时只有一次生效
+import threading as _threading
+_rr_ok, _rr_err = [], []
+def _concurrent_restore():
+    try:
+        restore_from_point(again["restore_point"]["digest"])
+        _rr_ok.append(1)
+    except MigrationRestoreError:
+        _rr_err.append(1)
+_t1 = _threading.Thread(target=_concurrent_restore)
+_t2 = _threading.Thread(target=_concurrent_restore)
+_t1.start(); _t2.start(); _t1.join(); _t2.join()
+assert len(_rr_ok) == 1 and len(_rr_err) == 1, (_rr_ok, _rr_err)
+print("13. 审查数据迁移包（导出稳定/规范化摘要/只读预检/一次性令牌/整体替换/"
+      "恢复点保护/摘要二次确认/恢复交换可撤回/并发互斥/往返一致） OK")
 
 print("\n全部集成冒烟测试通过 ✔")

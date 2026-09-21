@@ -29,8 +29,9 @@ from .allergen_panel import PanelError, build_panel_preview, list_panel_records
 from .analysis import flatten, normalize_name
 from .changeover import (ChangeoverError, build_changeover_preview,
                          list_changeover_products)
-from .migration import (MigrationConfirmError, build_export, confirm_import,
-                        precheck_package)
+from .migration import (MigrationConfirmError, MigrationRestoreError,
+                        build_export, confirm_import, latest_restore_point,
+                        precheck_package, restore_from_point)
 from .parser import parse_recipe
 from .pool_trace import (PoolTraceError, build_pool_trace_preview,
                          list_trace_records)
@@ -151,6 +152,10 @@ class MigrationPrecheckRequest(BaseModel):
 class MigrationImportRequest(BaseModel):
     token: str
     text: str
+
+
+class MigrationRestoreRequest(BaseModel):
+    digest: str
 
 
 # ---------- 页面 ----------
@@ -592,11 +597,13 @@ def migration_precheck(payload: MigrationPrecheckRequest):
 
 @app.post("/api/migration/import")
 def migration_import(payload: MigrationImportRequest):
-    """凭一次性令牌确认导入：单个 SQLite 事务整体替换，失败整体回滚。
+    """凭一次性令牌确认导入：单事务先存恢复点再整体替换，失败整体回滚。
 
     令牌必须来自对**同一份文件内容**的预检（绑定其 SHA-256），且只能
     使用一次；令牌无效 / 过期 / 摘要不匹配或校验未通过时返回 400，
-    ``detail.problems`` 逐项给出原因，均不写库。
+    ``detail.problems`` 逐项给出原因，均不写库。成功替换前会在同一事务
+    内把当前数据保存为最新恢复点（响应的 ``restore_point`` 字段；当前库
+    为空时为 null），替换失败不会产生恢复点。并发确认最多一次生效。
     """
     try:
         return confirm_import(payload.text, payload.token)
@@ -604,3 +611,30 @@ def migration_import(payload: MigrationImportRequest):
         raise HTTPException(
             status_code=400,
             detail={"message": str(exc), "problems": exc.problems})
+
+
+@app.get("/api/migration/restore-point")
+def migration_restore_point():
+    """最新迁移恢复点（只读）。
+
+    从未成功确认导入过非空数据时 ``restore_point`` 为 null；否则返回
+    恢复点创建时间、产生原因（import=确认导入前自动保存 / restore=
+    一键恢复前交换保存）、字典 / 别名 / 审查记录三类数量与内容摘要
+    （SHA-256，恢复时需逐字输入以二次确认）。
+    """
+    return {"restore_point": latest_restore_point()}
+
+
+@app.post("/api/migration/restore")
+def migration_restore(payload: MigrationRestoreRequest):
+    """凭恢复点摘要一键恢复（二次确认）。
+
+    请求体 ``digest`` 必须与最新恢复点摘要逐字一致。恢复在单个事务内
+    先把**当前数据**交换保存为新的最新恢复点（使误恢复可再次一键
+    撤回），再用旧恢复点内容整体替换；摘要不一致 / 恢复点不存在 /
+    内容损坏 / 有其他迁移写操作进行中时返回 400 且不写库。
+    """
+    try:
+        return restore_from_point(payload.digest)
+    except MigrationRestoreError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)})

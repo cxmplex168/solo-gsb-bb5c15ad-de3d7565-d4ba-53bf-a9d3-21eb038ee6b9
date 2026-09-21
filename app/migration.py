@@ -15,8 +15,17 @@
    **不写库**；全部通过时签发一枚**绑定该文件摘要的一次性确认令牌**
    （限时有效）。
 2. 确认导入：凭令牌 + 原文件文本确认；令牌不存在、已使用、已过期或与
-   文件摘要不匹配均拒绝。通过后在**单个 SQLite 事务**内整体替换字典 /
-   别名 / 审查记录三张表，任一步失败整体回滚。
+   文件摘要不匹配均拒绝。通过后在**单个 SQLite 事务**内先把当前字典 /
+   别名 / 审查记录保存为**最新恢复点**（含时间、三类数量与内容摘要），
+   再整体替换三张表；任一步失败整体回滚，**替换失败不会产生恢复点**。
+
+恢复点
+------
+确认导入成功后，迁移区展示最新恢复点（创建时间 / 产生原因 / 三类数量 /
+内容摘要）。用户**输入该恢复点摘要二次确认**后可一键恢复：恢复在单个
+事务内先把当前数据交换保存为**新的最新恢复点**（使误恢复可再次一键
+撤回），再用旧恢复点内容整体替换。任一确认导入 / 恢复的写操作持进程级
+互斥锁；叠加令牌一次性，并发确认最多一次生效。
 """
 from __future__ import annotations
 
@@ -26,7 +35,7 @@ import re
 import secrets
 import threading
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from . import db
 from .aliases import _find_cycles
@@ -538,6 +547,21 @@ class MigrationConfirmError(Exception):
         self.problems = problems or []
 
 
+class MigrationRestoreError(Exception):
+    """恢复被拒绝（无恢复点 / 摘要不一致 / 恢复点损坏 / 有写操作进行中）。"""
+
+
+# 确认导入与一键恢复共用同一把进程级互斥锁：同一时刻只允许一个迁移写操作。
+# 叠加确认令牌的一次性，并发确认导入最多只有一次能生效；并发恢复同理，
+# 后到者直接收到「有其他迁移操作正在进行」而不会连续交换状态。
+_write_lock = threading.Lock()
+
+
+def latest_restore_point() -> Optional[dict]:
+    """最新恢复点元数据（无恢复点时为 None，只读）。"""
+    return db.get_restore_point()
+
+
 def precheck_package(text: str) -> dict:
     """只读预检：解析并逐项校验迁移包，**不写库**。
 
@@ -559,8 +583,12 @@ def precheck_package(text: str) -> dict:
         if any(cur.values()):
             outcome["warnings"].append(
                 f"导入将整体替换当前数据（现有：字典 {cur['dict']} 条 / "
-                f"别名 {cur['aliases']} 条 / 审查记录 {cur['reviews']} 条），"
-                "替换后不可恢复")
+                f"别名 {cur['aliases']} 条 / 审查记录 {cur['reviews']} 条）；"
+                "替换前会自动保存当前数据为最新恢复点，可在迁移区凭摘要"
+                "一键恢复（恢复同样可撤回）")
+        else:
+            outcome["warnings"].append(
+                "当前库为空，导入不会产生恢复点（没有需要保护的数据）")
         outcome["token"] = issue_token(outcome["sha256"])
         outcome["expires_in"] = TOKEN_TTL_SECONDS
     else:
@@ -569,10 +597,12 @@ def precheck_package(text: str) -> dict:
 
 
 def confirm_import(text: str, token: str) -> dict:
-    """凭一次性令牌确认导入：单个 SQLite 事务整体替换，失败回滚。
+    """凭一次性令牌确认导入：单事务先存恢复点再整体替换，失败回滚。
 
     令牌必须绑定该文件的摘要（即预检通过的是同一份内容）；确认前会
-    再次完整校验，任一步失败都不写库或整体回滚。
+    再次完整校验，任一步失败都不写库或整体回滚。成功替换后返回导入
+    数量、文件摘要与本次保存的最新恢复点元数据（当前库为空时为 None）。
+    写操作持进程级互斥锁；叠加令牌一次性，并发确认最多一次生效。
     """
     try:
         package = json.loads(text)
@@ -581,14 +611,51 @@ def confirm_import(text: str, token: str) -> dict:
     if not isinstance(package, dict):
         raise MigrationConfirmError("迁移包顶层应为 JSON 对象")
     digest = package_digest(package)
-    if not consume_token(token, digest):
-        raise MigrationConfirmError(
-            "确认令牌无效、已使用、已过期或与迁移包摘要不匹配，请重新预检")
     outcome = validate_package(package)
     if not outcome["ok"]:
         raise MigrationConfirmError("迁移包校验未通过，未执行导入",
                                     outcome["problems"])
     data = package["data"]
-    db.replace_all(dict_entries=data["dict"], aliases=data["aliases"],
-                   reviews=data["reviews"])
-    return {"ok": True, "imported": _counts_of(data), "sha256": digest}
+    # 写操作互斥：与并发的导入 / 恢复同时只有一个进入临界区
+    if not _write_lock.acquire(blocking=False):
+        raise MigrationConfirmError(
+            "有其他迁移导入 / 恢复操作正在进行，请稍后重试（令牌仍有效）")
+    try:
+        # 持锁后再消费一次性令牌：并发的重复确认只有一个能通过，
+        # 落败者的令牌不被消费，可稍后重试
+        if not consume_token(token, digest):
+            raise MigrationConfirmError(
+                "确认令牌无效、已使用、已过期或与迁移包摘要不匹配，请重新预检")
+        save_point = any(db.table_counts().values())
+        point = db.replace_all(dict_entries=data["dict"],
+                               aliases=data["aliases"],
+                               reviews=data["reviews"],
+                               save_point=save_point, point_reason="import")
+    finally:
+        _write_lock.release()
+    return {"ok": True, "imported": _counts_of(data), "sha256": digest,
+            "restore_point": point}
+
+
+def restore_from_point(digest: str) -> dict:
+    """凭恢复点摘要一键恢复（二次确认）。
+
+    恢复在单个事务内先把当前数据交换保存为新的最新恢复点（误恢复可
+    再次一键撤回），再用旧恢复点整体替换；摘要不一致、恢复点不存在或
+    内容损坏时拒绝且不写库。返回恢复后的三类数量、当前库数量与新恢复
+    点元数据。并发写操作互斥。
+    """
+    if not digest or not str(digest).strip():
+        raise MigrationRestoreError("请输入恢复点摘要以二次确认")
+    if not _write_lock.acquire(blocking=False):
+        raise MigrationRestoreError(
+            "有其他迁移导入 / 恢复操作正在进行，请稍后重试")
+    try:
+        result = db.restore_from_point(str(digest).strip())
+    except ValueError as exc:
+        raise MigrationRestoreError(str(exc))
+    finally:
+        _write_lock.release()
+    result["current_counts"] = db.table_counts()
+    result["ok"] = True
+    return result
